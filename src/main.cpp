@@ -153,7 +153,7 @@ void process (const char* file_1,const char* file_2) {
 }
 
 static int process_realsense_live(int width, int height, int fps) {
-  cout << "麦克阿瑟·小胖 11271518" << endl;
+  cout << "XiaoPang 11301901" << endl;
   rs2::pipeline pipe;
   rs2::config cfg;
   cfg.enable_stream(RS2_STREAM_INFRARED, 1, width, height, RS2_FORMAT_Y8, fps);
@@ -199,6 +199,7 @@ static int process_realsense_live(int width, int height, int fps) {
   param.add_corners           = 0;
   Elas elas(param);
   cv::Mat prevDepth;
+  float prevDispMax = 0.0f;
 
   while (true) {
     rs2::frameset frames = pipe.wait_for_frames();
@@ -222,21 +223,37 @@ static int process_realsense_live(int width, int height, int fps) {
     dims[2] = (int32_t)procL.step;
     elas.process(procL.data, procR.data, D1v.data(), D2v.data(), dims);
 
-    float disp_max = 0.0f;
-    for (size_t i = 0, n = D1v.size(); i < n; ++i) {
-      float a = D1v[i];
-      if (a > disp_max) disp_max = a;
-    }
-    if (disp_max <= 0.0f) disp_max = 1.0f;
-
     cv::Mat dispF(sz, CV_32F, D1v.data());
     cv::Mat dispFiltered;
     cv::medianBlur(dispF, dispFiltered, 5);
-    cv::Mat disp8; dispFiltered.convertTo(disp8, CV_8U, 255.0 / disp_max);
+    cv::Mat validMask = dispFiltered > 0;
+
+    double minDisp = 0.0, maxDisp = 0.0;
+    if (cv::countNonZero(validMask) > 0) {
+      cv::minMaxLoc(dispFiltered, &minDisp, &maxDisp, nullptr, nullptr, validMask);
+    }
+
+    float disp_max = static_cast<float>(maxDisp);
+    if (disp_max <= 0.0f) {
+      if (prevDispMax > 0.0f) {
+        disp_max = prevDispMax;
+      } else {
+        disp_max = 1.0f;
+      }
+    } else {
+      if (prevDispMax > 0.0f) {
+        float alphaScale = 0.9f;
+        disp_max = alphaScale * prevDispMax + (1.0f - alphaScale) * disp_max;
+      }
+    }
+    if (disp_max <= 0.0f) disp_max = 1.0f;
+    prevDispMax = disp_max;
+
+    cv::Mat disp8;
+    dispFiltered.convertTo(disp8, CV_8U, 255.0f / disp_max);
 
     cv::Mat depthF = cv::Mat::zeros(sz, CV_32F);
     cv::divide(f_rect * baseline, dispFiltered, depthF, 1.0, CV_32F);
-    cv::Mat validMask = dispFiltered > 0;
     depthF.setTo(0, ~validMask);
 
     cv::Mat depthFiltered = depthF.clone();
@@ -249,15 +266,18 @@ static int process_realsense_live(int width, int height, int fps) {
     if (!prevDepth.empty()) {
       float alpha = 0.5f;
       cv::Mat validPrev = prevDepth > 0;
-      cv::Mat validBoth;
-      cv::bitwise_and(validMask, validPrev, validBoth);
       for (int y = 0; y < depthF.rows; ++y) {
         float* currPtr = depthF.ptr<float>(y);
         float* prevPtr = prevDepth.ptr<float>(y);
-        const uchar* maskPtr = validBoth.ptr<uchar>(y);
+        const uchar* currMaskPtr = validMask.ptr<uchar>(y);
+        const uchar* prevMaskPtr = validPrev.ptr<uchar>(y);
         for (int x = 0; x < depthF.cols; ++x) {
-          if (maskPtr[x]) {
+          bool currValid = currMaskPtr[x] != 0;
+          bool prevValid = prevMaskPtr[x] != 0;
+          if (currValid && prevValid) {
             currPtr[x] = alpha * currPtr[x] + (1.0f - alpha) * prevPtr[x];
+          } else if (!currValid && prevValid) {
+            currPtr[x] = prevPtr[x];
           }
         }
       }
@@ -291,7 +311,7 @@ static int process_realsense_live(int width, int height, int fps) {
 
 int main (int argc, char** argv) {
 
-  // run demo
+  // 运行demo
   if (argc==2 && !strcmp(argv[1],"demo")) {
     process("img/cones_left.pgm",   "img/cones_right.pgm");
     process("img/aloe_left.pgm",    "img/aloe_right.pgm");
@@ -302,7 +322,7 @@ int main (int argc, char** argv) {
     process("img/urban4_left.pgm",  "img/urban4_right.pgm");
     cout << "... done!" << endl;
 
-  // compute disparity from input pair
+  // 从输入图像对计算视差图
   } else if (argc==3) {
     process(argv[1],argv[2]);
     cout << "... done!" << endl;
@@ -313,7 +333,7 @@ int main (int argc, char** argv) {
     process_realsense_live(w, h, fps);
     cout << "... done!" << endl;
 
-  // display help
+  // 显示帮助信息
   } else {
     cout << endl;
     cout << "ELAS demo program usage: " << endl;

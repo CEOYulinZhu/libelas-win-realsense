@@ -48,6 +48,59 @@ static void onDepthMouse(int event, int x, int y, int flags, void* userdata) {
     cout << "Depth at (" << x << ", " << y << "): invalid, depth FPS: " << g_depthFps << endl;
 }
 
+static void configureStructuredLight(const rs2::pipeline_profile& profile) {
+  try {
+    rs2::device dev = profile.get_device();
+    for (auto&& sensor : dev.query_sensors()) {
+      if (sensor.supports(RS2_OPTION_EMITTER_ENABLED)) {
+        auto erange = sensor.get_option_range(RS2_OPTION_EMITTER_ENABLED);
+        float evalue = 1.0f; // 0: off, 1: on, 2: auto（若支持）
+        if (evalue < erange.min) evalue = erange.min;
+        if (evalue > erange.max) evalue = erange.max;
+        sensor.set_option(RS2_OPTION_EMITTER_ENABLED, evalue);
+      }
+      if (sensor.supports(RS2_OPTION_LASER_POWER)) {
+        auto range = sensor.get_option_range(RS2_OPTION_LASER_POWER);
+        float value = 150.0f;
+        if (value < range.min) value = range.min;
+        if (value > range.max) value = range.max;
+        sensor.set_option(RS2_OPTION_LASER_POWER, value);
+      }
+    }
+  } catch (const rs2::error&) {
+  }
+}
+
+static void fillDepthHoles(cv::Mat& depth) {
+  if (depth.empty() || depth.type() != CV_32F) return;
+  cv::Mat src = depth.clone();
+  for (int y = 1; y < depth.rows - 1; ++y) {
+    float* d = depth.ptr<float>(y);
+    for (int x = 1; x < depth.cols - 1; ++x) {
+      if (d[x] > 0.0f) continue;
+      float left = src.at<float>(y, x - 1);
+      float right = src.at<float>(y, x + 1);
+      if (left > 0.0f && right > 0.0f) {
+        float diff = left - right;
+        if (diff < 0.0f) diff = -diff;
+        if (diff < 0.2f) {
+          d[x] = 0.5f * (left + right);
+          continue;
+        }
+      }
+      float up = src.at<float>(y - 1, x);
+      float down = src.at<float>(y + 1, x);
+      if (up > 0.0f && down > 0.0f) {
+        float diff = up - down;
+        if (diff < 0.0f) diff = -diff;
+        if (diff < 0.2f) {
+          d[x] = 0.5f * (up + down);
+        }
+      }
+    }
+  }
+}
+
 image<uchar>* loadImage(const char* name);
 
 // 计算一对输入图像 file_1、file_2 的视差
@@ -159,6 +212,7 @@ static int process_realsense_live(int width, int height, int fps) {
   cfg.enable_stream(RS2_STREAM_INFRARED, 1, width, height, RS2_FORMAT_Y8, fps);
   cfg.enable_stream(RS2_STREAM_INFRARED, 2, width, height, RS2_FORMAT_Y8, fps);
   rs2::pipeline_profile profile = pipe.start(cfg);
+  configureStructuredLight(profile);
 
   auto left_sp  = profile.get_stream(RS2_STREAM_INFRARED, 1).as<rs2::video_stream_profile>();
   auto right_sp = profile.get_stream(RS2_STREAM_INFRARED, 2).as<rs2::video_stream_profile>();
@@ -186,6 +240,8 @@ static int process_realsense_live(int width, int height, int fps) {
   cv::initUndistortRectifyMap(K1, D1, R1, P1, sz, CV_16SC2, map1L, map2L);
   cv::initUndistortRectifyMap(K2, D2, R2, P2, sz, CV_16SC2, map1R, map2R);
 
+  cv::namedWindow("Left IR", cv::WINDOW_NORMAL);
+  cv::namedWindow("Right IR", cv::WINDOW_NORMAL);
   cv::namedWindow("Disparity", cv::WINDOW_NORMAL);
   cv::namedWindow("Depth", cv::WINDOW_NORMAL);
   cv::setMouseCallback("Depth", onDepthMouse);
@@ -197,6 +253,7 @@ static int process_realsense_live(int width, int height, int fps) {
   param.postprocess_only_left = false;
   param.ipol_gap_width        = 10;
   param.add_corners           = 0;
+   param.match_texture         = 1;
   Elas elas(param);
   cv::Mat prevDepth;
   float prevDispMax = 0.0f;
@@ -224,6 +281,9 @@ static int process_realsense_live(int width, int height, int fps) {
     // Optional: Slight blur to reduce sensor noise further
     cv::GaussianBlur(procL, procL, cv::Size(3,3), 0.0);
     cv::GaussianBlur(procR, procR, cv::Size(3,3), 0.0);
+
+    cv::imshow("Left IR", procL);
+    cv::imshow("Right IR", procR);
 
     dims[0] = procL.cols;
     dims[1] = procL.rows;
@@ -269,17 +329,15 @@ static int process_realsense_live(int width, int height, int fps) {
     cv::divide(f_rect * baseline, dispFiltered, depthF, 1.0, CV_32F);
     depthF.setTo(0, ~validMask);
 
-    cv::Mat depthFiltered = depthF.clone();
-    cv::Mat tmpDepth = depthF.clone();
-    tmpDepth.setTo(0, ~validMask);
-    cv::medianBlur(tmpDepth, tmpDepth, 5);
-    tmpDepth.copyTo(depthFiltered, validMask);
-    depthF = depthFiltered;
+    fillDepthHoles(depthF);
+    validMask = depthF > 0;
 
     if (!prevDepth.empty()) {
       // [Flicker Solution] 3. Time consistency
       // Reduce alpha to 0.3 (30% new, 70% old) to increase stability
-      float alpha = 0.3f; 
+      float alphaStatic = 0.3f;
+      float alphaMoving = 0.8f;
+      float depthDiffThresh = 0.05f;
       cv::Mat validPrev = prevDepth > 0;
       for (int y = 0; y < depthF.rows; ++y) {
         float* currPtr = depthF.ptr<float>(y);
@@ -290,9 +348,15 @@ static int process_realsense_live(int width, int height, int fps) {
           bool currValid = currMaskPtr[x] != 0;
           bool prevValid = prevMaskPtr[x] != 0;
           if (currValid && prevValid) {
-            currPtr[x] = alpha * currPtr[x] + (1.0f - alpha) * prevPtr[x];
-          } else if (!currValid && prevValid) {
-            currPtr[x] = prevPtr[x];
+            float dCurr = currPtr[x];
+            float dPrev = prevPtr[x];
+            float diff = dCurr - dPrev;
+            if (diff < 0.0f) diff = -diff;
+            if (diff < depthDiffThresh) {
+              currPtr[x] = alphaStatic * dCurr + (1.0f - alphaStatic) * dPrev;
+            } else {
+              currPtr[x] = alphaMoving * dCurr + (1.0f - alphaMoving) * dPrev;
+            }
           }
         }
       }
@@ -301,7 +365,7 @@ static int process_realsense_live(int width, int height, int fps) {
 
     cv::Mat depthVis8;
     double alpha_depth = 30.0;
-    depthF.convertTo(depthVis8, CV_8U, alpha_depth);f
+    depthF.convertTo(depthVis8, CV_8U, alpha_depth);
     cv::Mat depthColor;
     cv::applyColorMap(depthVis8, depthColor, cv::COLORMAP_JET);
 

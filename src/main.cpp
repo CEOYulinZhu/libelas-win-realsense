@@ -193,13 +193,17 @@ static int process_realsense_live(int width, int height, int fps) {
   int32_t dims[3] = { sz.width, sz.height, sz.width };
   std::vector<float> D1v(sz.width * sz.height);
   std::vector<float> D2v(sz.width * sz.height);
-  Elas::parameters param(Elas::MIDDLEBURY);
+  Elas::parameters param(Elas::ROBOTICS);
   param.postprocess_only_left = false;
   param.ipol_gap_width        = 10;
   param.add_corners           = 0;
   Elas elas(param);
   cv::Mat prevDepth;
   float prevDispMax = 0.0f;
+
+  // [Flicker Solution] 1. Use shared CLAHE instead of independent equalizeHist
+  // to ensure consistent photometric mapping and suppress noise in low-texture areas.
+  cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
 
   while (true) {
     rs2::frameset frames = pipe.wait_for_frames();
@@ -213,8 +217,11 @@ static int process_realsense_live(int width, int height, int fps) {
     cv::remap(rawR, rectR, map1R, map2R, cv::INTER_LINEAR);
 
     cv::Mat procL, procR;
-    cv::equalizeHist(rectL, procL);
-    cv::equalizeHist(rectR, procR);
+    // [Flicker Solution] Apply shared CLAHE
+    clahe->apply(rectL, procL);
+    clahe->apply(rectR, procR);
+
+    // Optional: Slight blur to reduce sensor noise further
     cv::GaussianBlur(procL, procL, cv::Size(3,3), 0.0);
     cv::GaussianBlur(procR, procR, cv::Size(3,3), 0.0);
 
@@ -224,8 +231,14 @@ static int process_realsense_live(int width, int height, int fps) {
     elas.process(procL.data, procR.data, D1v.data(), D2v.data(), dims);
 
     cv::Mat dispF(sz, CV_32F, D1v.data());
+    
+    // [Flicker Solution] 3. Bilateral Filter to stabilize disparity edges
+    // Filter before median blur to preserve structure better
+    cv::Mat dispBilateral;
+    cv::bilateralFilter(dispF, dispBilateral, 5, 2.0, 5.0);
+    
     cv::Mat dispFiltered;
-    cv::medianBlur(dispF, dispFiltered, 5);
+    cv::medianBlur(dispBilateral, dispFiltered, 5);
     cv::Mat validMask = dispFiltered > 0;
 
     double minDisp = 0.0, maxDisp = 0.0;
@@ -264,7 +277,9 @@ static int process_realsense_live(int width, int height, int fps) {
     depthF = depthFiltered;
 
     if (!prevDepth.empty()) {
-      float alpha = 0.5f;
+      // [Flicker Solution] 3. Time consistency
+      // Reduce alpha to 0.3 (30% new, 70% old) to increase stability
+      float alpha = 0.3f; 
       cv::Mat validPrev = prevDepth > 0;
       for (int y = 0; y < depthF.rows; ++y) {
         float* currPtr = depthF.ptr<float>(y);
@@ -286,7 +301,7 @@ static int process_realsense_live(int width, int height, int fps) {
 
     cv::Mat depthVis8;
     double alpha_depth = 30.0;
-    depthF.convertTo(depthVis8, CV_8U, alpha_depth);
+    depthF.convertTo(depthVis8, CV_8U, alpha_depth);f
     cv::Mat depthColor;
     cv::applyColorMap(depthVis8, depthColor, cv::COLORMAP_JET);
 
